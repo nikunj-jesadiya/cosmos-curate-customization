@@ -107,6 +107,17 @@ cvcuda-cu12 = "*" # not available on conda-forge
 flashinfer-python = ">=0.4.0rc3" # not available on conda-forge; pre-release to avoid pynvml dependency
 PyNvVideoCodec = "*" # not available on conda-forge
 vllm = "==0.11.2" # not available on conda-forge
+# RF-DETR + BoxMOT tracking packages - packages with no conflicts
+peft = "*"
+pycocotools = "*"
+ftfy = "*"
+filterpy = "*"
+lap = "*"
+gdown = "*"
+defusedxml = "*"
+[feature.unified.tasks]
+# Install packages with conflicting dependencies (bypasses regex version conflict)
+install-tracking = "pip install --no-deps rfdetr boxmot supervision"
 
 [feature.legacy-transformers.dependencies]
 flash-attn = "*"

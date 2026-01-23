@@ -184,6 +184,8 @@ class Clip:
     # captioning
     windows: list[Window] = attrs.Factory(list)
     filter_windows: list[Window] = attrs.Factory(list)
+    # object tracking / pseudo-labeling
+    tracking_result: TrackingResult | None = None
     # for testing
     cosmos_embed1_text_match: tuple[str, float] | None = None
     intern_video_2_text_match: tuple[str, float] | None = None
@@ -718,3 +720,199 @@ class VllmCaptionRequest:
     inputs: dict[str, Any]
     caption: str | None = None
     stage2_prompt: str | None = None
+
+
+# =============================================================================
+# Pseudo-Labeling / Object Tracking Data Models
+# =============================================================================
+
+
+@attrs.define
+class BoundingBox2D:
+    """2D bounding box in pixel coordinates [xmin, ymin, xmax, ymax]."""
+
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+
+    def to_list(self) -> list[float]:
+        """Convert to list format."""
+        return [self.xmin, self.ymin, self.xmax, self.ymax]
+
+    def expand(self, ratio: float, img_width: int, img_height: int) -> BoundingBox2D:
+        """Expand bounding box by a ratio, clamped to image bounds."""
+        width = self.xmax - self.xmin
+        height = self.ymax - self.ymin
+        expand_w = width * ratio
+        expand_h = height * ratio
+        return BoundingBox2D(
+            xmin=max(0, self.xmin - expand_w),
+            ymin=max(0, self.ymin - expand_h),
+            xmax=min(img_width, self.xmax + expand_w),
+            ymax=min(img_height, self.ymax + expand_h),
+        )
+
+
+@attrs.define
+class FrameInstance:
+    """A single object instance detected in a frame."""
+
+    object_id: str
+    instance_id: int
+    semantic_id: int
+    bounding_box_2d_tight: BoundingBox2D
+    bounding_box_2d_loose: BoundingBox2D
+    confidence: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary format for JSON serialization."""
+        return {
+            "object_id": self.object_id,
+            "instance_id": self.instance_id,
+            "semantic_id": self.semantic_id,
+            "bounding_box_2d_tight": [round(x, 2) for x in self.bounding_box_2d_tight.to_list()],
+            "bounding_box_2d_loose": [round(x, 2) for x in self.bounding_box_2d_loose.to_list()],
+            "confidence": round(self.confidence, 4),
+        }
+
+
+@attrs.define
+class TrackedInstance:
+    """Metadata for a tracked object across frames."""
+
+    object_id: str
+    object_type: str
+    instance_id: int
+    semantic_id: int
+    color: list[int]
+    caption: str
+    track_id: int
+    first_frame: int
+    last_frame: int
+    confidence_avg: float
+    frame_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary format for JSON serialization."""
+        return {
+            "object_id": self.object_id,
+            "object_type": self.object_type,
+            "instance_id": self.instance_id,
+            "semantic_id": self.semantic_id,
+            "color": self.color,
+            "caption": self.caption,
+            "track_id": self.track_id,
+            "first_frame": self.first_frame,
+            "last_frame": self.last_frame,
+            "confidence_avg": round(self.confidence_avg, 4),
+            "frame_count": self.frame_count,
+        }
+
+
+@attrs.define
+class FrameAnnotation:
+    """Annotations for a single frame including all detected instances."""
+
+    frame_number: int
+    width: int
+    height: int
+    instances: list[FrameInstance] = attrs.Factory(list)
+    detection_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary format for JSON serialization."""
+        return {
+            "format": "png",
+            "frame_number": self.frame_number,
+            "width": self.width,
+            "height": self.height,
+            "instances": [inst.to_dict() for inst in self.instances],
+            "detection_count": self.detection_count,
+        }
+
+
+@attrs.define
+class TrackingResult:
+    """Complete tracking results for a video/clip including instances and frame annotations."""
+
+    # Video info
+    source_path: str = ""
+    fps: float = 0.0
+    width: int = 0
+    height: int = 0
+    total_frames: int = 0
+    # Tracking configuration
+    tracker_name: str = "bytetrack"
+    detection_threshold: float = 0.3
+    # Results
+    instances: dict[str, TrackedInstance] = attrs.Factory(dict)
+    frames: dict[str, FrameAnnotation] = attrs.Factory(dict)
+    # Visualization frames (only populated if save_vis_frames is True)
+    # Format: list of tuples (frame_idx, detection_frame_bytes, tracking_frame_bytes)
+    vis_frames: list[tuple[int, bytes, bytes]] = attrs.Factory(list)
+    # RGB frames (only populated if save_rgb_frames is True)
+    # Format: list of tuples (frame_idx, frame_bytes)
+    rgb_frames: list[tuple[int, bytes]] = attrs.Factory(list)
+    # Video bytes (only populated if save_video is True)
+    detection_video_bytes: bytes | None = None
+    tracking_video_bytes: bytes | None = None
+
+    def to_instances_json(self) -> dict[str, Any]:
+        """Convert to instances.json format."""
+        return {
+            "version": 2.0,
+            "video_info": {
+                "source": self.source_path,
+                "fps": self.fps,
+                "width": self.width,
+                "height": self.height,
+                "total_frames": self.total_frames,
+            },
+            "instances": {k: v.to_dict() for k, v in self.instances.items()},
+        }
+
+    def to_objects_json(self) -> dict[str, Any]:
+        """Convert to objects.json format."""
+        return {
+            "version": 2.0,
+            "frames": {k: v.to_dict() for k, v in self.frames.items()},
+        }
+
+    def get_major_size(self) -> int:
+        """Calculate memory size of tracking result."""
+        return get_major_size(self)
+
+
+@attrs.define
+class TrackingConfig:
+    """Configuration for object tracking stage.
+
+    Args:
+        tracker_name: Tracker algorithm to use (bytetrack, deepocsort, botsort, boosttrack, hybridsort).
+        detection_threshold: Confidence threshold for detections.
+        iou_threshold: IoU threshold for tracking association.
+        per_class: Whether to track objects per class.
+        min_track_frames: Minimum frames a track must appear in to be kept.
+        bbox_expansion_ratio: Ratio to expand bbox for loose bounding box.
+        max_age: Max frames to keep lost track before deletion.
+        min_hits: Min detections before confirming track.
+        save_vis_frames: Whether to save visualization frames.
+        save_video: Whether to save annotated videos (detection + tracking).
+        save_rgb_frames: Whether to save raw RGB frames.
+        target_classes: List of class names to track (None = all classes).
+
+    """
+
+    tracker_name: str = "bytetrack"
+    detection_threshold: float = 0.3
+    iou_threshold: float = 0.3
+    per_class: bool = True
+    min_track_frames: int = 1
+    bbox_expansion_ratio: float = 0.1
+    max_age: int = 30
+    min_hits: int = 3
+    save_vis_frames: bool = False
+    save_video: bool = False
+    save_rgb_frames: bool = False
+    target_classes: list[str] | None = None

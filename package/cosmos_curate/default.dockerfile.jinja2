@@ -156,6 +156,10 @@ RUN cd {{code_dir_str}} && \
     pixi run -e {{ env }} bash /tmp/cosmos_curate_build_envs/{{ env }}/post_install.sh
 {% endfor %}
 
+# Install RF-DETR + BoxMOT tracking packages (defined as pixi task to bypass dependency conflicts)
+RUN cd {{code_dir_str}} && \
+    pixi run -e unified install-tracking
+
 # For cosmos-xenna development
 # For every environment, uninstall cosmos-xenna and then reinstall from local build.
 {% if use_local_xenna_build %}

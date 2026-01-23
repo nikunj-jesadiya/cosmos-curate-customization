@@ -371,6 +371,9 @@ class ClipWriterStage(CuratorStage):
                         for clip in video.filtered_clips
                     ]
 
+                    # write tracking results if available
+                    futures_clips += [executor.submit(self._write_clip_tracking, clip) for clip in video.clips]
+
                     # wait for all clip-level tasks to finish and gather stats
                     for future_c in futures_clips:
                         result = future_c.result()
@@ -613,6 +616,108 @@ class ClipWriterStage(CuratorStage):
             clip_stats.num_passed += 1
         return clip_stats
 
+    def _write_clip_tracking(self, clip: Clip) -> None:
+        """Write tracking results (instances.json and objects.json) for a clip.
+
+        Args:
+            clip: Clip to write tracking results for.
+
+        """
+        if clip.tracking_result is None:
+            return
+
+        if self._dry_run:
+            return
+
+        # Get the tracking output directory matching pseudo-labeling structure:
+        # v0/tracking/<scene_id>/raw/<clip_uuid>.mp4 (original video)
+        # v0/tracking/<scene_id>/raw/<clip_uuid>/    (data folder)
+        # Use source video filename (without extension) as scene_id
+        scene_id = pathlib.Path(clip.source_video).stem
+        tracking_base = self.get_output_path_tracking(self._output_path, "v0")
+        raw_dir = get_full_path(get_full_path(tracking_base, scene_id), "raw")
+        tracking_dir = get_full_path(raw_dir, str(clip.uuid))
+
+        # Write original clip as sibling to data folder (matching pseudo-labeling structure)
+        if clip.encoded_data is not None:
+            clip_video_dest = get_full_path(raw_dir, f"{clip.uuid}.mp4")
+            self._write_data(clip.encoded_data, clip_video_dest, f"original clip {clip.uuid}", clip.source_video)
+
+        # Write instances.json
+        instances_dest = get_full_path(tracking_dir, "instances.json")
+        instances_data = clip.tracking_result.to_instances_json()
+        self._write_json_data(instances_data, instances_dest, f"tracking instances {clip.uuid}", clip.source_video)
+
+        # Write objects.json
+        objects_dest = get_full_path(tracking_dir, "objects.json")
+        objects_data = clip.tracking_result.to_objects_json()
+        self._write_json_data(objects_data, objects_dest, f"tracking objects {clip.uuid}", clip.source_video)
+
+        # Write visualization frames if available
+        if clip.tracking_result.vis_frames:
+            vis_detection_dir = get_full_path(tracking_dir, "vis_detection")
+            vis_tracking_dir = get_full_path(tracking_dir, "vis_tracking")
+
+            for frame_idx, det_bytes, track_bytes in clip.tracking_result.vis_frames:
+                # Write detection visualization
+                det_dest = get_full_path(vis_detection_dir, f"{frame_idx:06d}.jpg")
+                self._write_data(det_bytes, det_dest, f"detection vis {frame_idx}", clip.source_video)
+
+                # Write tracking visualization
+                track_dest = get_full_path(vis_tracking_dir, f"{frame_idx:06d}.jpg")
+                self._write_data(track_bytes, track_dest, f"tracking vis {frame_idx}", clip.source_video)
+
+            # Clear vis_frames after writing to free memory
+            clip.tracking_result.vis_frames.clear()
+
+        # Write video files if available (filename format: <clip_uuid>_detection.mp4)
+        if clip.tracking_result.detection_video_bytes:
+            det_video_dest = get_full_path(tracking_dir, f"{clip.uuid}_detection.mp4")
+            self._write_data(
+                clip.tracking_result.detection_video_bytes,
+                det_video_dest,
+                f"detection video {clip.uuid}",
+                clip.source_video,
+            )
+            # Clear to free memory
+            clip.tracking_result.detection_video_bytes = None
+
+        if clip.tracking_result.tracking_video_bytes:
+            track_video_dest = get_full_path(tracking_dir, f"{clip.uuid}_tracking.mp4")
+            self._write_data(
+                clip.tracking_result.tracking_video_bytes,
+                track_video_dest,
+                f"tracking video {clip.uuid}",
+                clip.source_video,
+            )
+            # Clear to free memory
+            clip.tracking_result.tracking_video_bytes = None
+
+        # Write RGB frames if available
+        if clip.tracking_result.rgb_frames:
+            rgb_dir = get_full_path(tracking_dir, "rgb")
+
+            for frame_idx, rgb_bytes in clip.tracking_result.rgb_frames:
+                rgb_dest = get_full_path(rgb_dir, f"{frame_idx:06d}.jpg")
+                self._write_data(rgb_bytes, rgb_dest, f"rgb frame {frame_idx}", clip.source_video)
+
+            # Clear to free memory
+            clip.tracking_result.rgb_frames.clear()
+
+    @staticmethod
+    def get_output_path_tracking(output_path: str, version: str = "v0") -> str:
+        """Get the path for tracking output.
+
+        Args:
+            output_path: Base output path.
+            version: Version string for output.
+
+        Returns:
+            Full path for tracking output.
+
+        """
+        return f"{output_path}/{version}/tracking"
+
     def _get_clip_embedding(self, clip: Clip) -> npt.NDArray[np.float32] | None:
         if self._embedding_algorithm == "internvideo2":
             return clip.intern_video_2_embedding
@@ -717,6 +822,14 @@ class ClipWriterStage(CuratorStage):
             data["embedding"] = embedding.reshape(-1).tolist()
             data["embedding_model_name"] = self._embedding_algorithm
             data["embedding_model_version"] = self._embedding_model_version
+
+        # Add tracking results if available
+        if clip.tracking_result is not None:
+            data["tracking"] = {
+                "num_objects": len(clip.tracking_result.instances),
+                "tracker_name": clip.tracking_result.tracker_name,
+                "detection_threshold": clip.tracking_result.detection_threshold,
+            }
 
         return data
 

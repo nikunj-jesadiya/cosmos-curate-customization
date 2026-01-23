@@ -95,7 +95,16 @@ from cosmos_curate.pipelines.video.read_write.remux_stages import RemuxStage
 from cosmos_curate.pipelines.video.read_write.summary_writers import (
     write_split_summary,
 )
-from cosmos_curate.pipelines.video.utils.data_model import SplitPipeTask, VllmConfig, VllmSamplingConfig, WindowConfig
+from cosmos_curate.pipelines.video.tracking.rfdetr_tracking_stage import (
+    RFDETRTrackingStage,
+)
+from cosmos_curate.pipelines.video.utils.data_model import (
+    SplitPipeTask,
+    TrackingConfig,
+    VllmConfig,
+    VllmSamplingConfig,
+    WindowConfig,
+)
 from cosmos_curate.pipelines.video.utils.decoder_utils import FrameExtractionPolicy
 from cosmos_curate.pipelines.video.utils.video_pipe_input import (
     extract_split_tasks,
@@ -654,6 +663,44 @@ def split(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
                 ),
             ),
         ]
+
+    # ==========================================================================
+    # Object Tracking / Pseudo-Labeling Stage
+    # ==========================================================================
+    if args.generate_tracking:
+        # Parse target classes if provided
+        target_classes = None
+        if args.tracking_target_classes:
+            target_classes = [c.strip() for c in args.tracking_target_classes.split(",")]
+
+        tracking_config = TrackingConfig(
+            tracker_name=args.tracking_algorithm,
+            detection_threshold=args.tracking_detection_threshold,
+            iou_threshold=args.tracking_iou_threshold,
+            per_class=args.tracking_per_class,
+            min_track_frames=args.tracking_min_track_frames,
+            max_age=args.tracking_max_age,
+            min_hits=args.tracking_min_hits,
+            target_classes=target_classes,
+            save_vis_frames=args.tracking_save_vis or args.tracking_save_video,
+            save_video=args.tracking_save_video,
+            save_rgb_frames=args.tracking_save_rgb,
+        )
+
+        stages += [
+            CuratorStageSpec(
+                RFDETRTrackingStage(
+                    tracking_config=tracking_config,
+                    num_gpus_per_worker=args.tracking_gpus_per_worker,
+                    verbose=args.verbose,
+                    log_stats=args.perf_profile,
+                ),
+            ),
+        ]
+        logger.info(
+            f"Object tracking enabled: algorithm={args.tracking_algorithm}, "
+            f"threshold={args.tracking_detection_threshold}"
+        )
 
     stages.append(
         CuratorStageSpec(
@@ -1408,6 +1455,93 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         action="store_true",
         default=False,
         help="If set, generated captions are used as input prompts again into Nemotron to refine them",
+    )
+    # ==========================================================================
+    # Pseudo-Labeling / Object Tracking Arguments
+    # ==========================================================================
+    parser.add_argument(
+        "--generate-tracking",
+        dest="generate_tracking",
+        action="store_true",
+        default=False,
+        help="Whether to run object detection and tracking (pseudo-labeling) on video clips.",
+    )
+    parser.add_argument(
+        "--tracking-algorithm",
+        type=str,
+        default="bytetrack",
+        choices=["bytetrack", "deepocsort", "botsort", "boosttrack", "hybridsort"],
+        help="Tracking algorithm to use for multi-object tracking.",
+    )
+    parser.add_argument(
+        "--tracking-detection-threshold",
+        type=float,
+        default=0.3,
+        help="Detection confidence threshold for object detection.",
+    )
+    parser.add_argument(
+        "--tracking-iou-threshold",
+        type=float,
+        default=0.3,
+        help="IoU threshold for tracking association.",
+    )
+    parser.add_argument(
+        "--tracking-per-class",
+        dest="tracking_per_class",
+        action="store_true",
+        default=True,
+        help="Whether to track objects per class (recommended for mixed scenes).",
+    )
+    parser.add_argument(
+        "--tracking-min-track-frames",
+        type=int,
+        default=1,
+        help="Minimum frames a track must appear in to be kept (filters short tracks).",
+    )
+    parser.add_argument(
+        "--tracking-max-age",
+        type=int,
+        default=30,
+        help="Max frames to keep lost track before deletion.",
+    )
+    parser.add_argument(
+        "--tracking-min-hits",
+        type=int,
+        default=3,
+        help="Min detections before confirming a track.",
+    )
+    parser.add_argument(
+        "--tracking-gpus-per-worker",
+        type=float,
+        default=1.0,
+        help="Number of GPUs per worker for tracking stage.",
+    )
+    parser.add_argument(
+        "--tracking-target-classes",
+        type=str,
+        default=None,
+        help="Comma-separated list of COCO class names to track (e.g., 'car,truck,person'). If not provided, tracks all classes.",
+    )
+    parser.add_argument(
+        "--tracking-save-vis",
+        dest="tracking_save_vis",
+        action="store_true",
+        default=False,
+        help="Save detection and tracking visualization frames (vis_detection/, vis_tracking/).",
+    )
+    parser.add_argument(
+        "--tracking-save-video",
+        dest="tracking_save_video",
+        action="store_true",
+        default=False,
+        help="Save annotated videos (detection.mp4, tracking.mp4).",
+    )
+    parser.add_argument(
+        "--tracking-save-rgb",
+        dest="tracking_save_rgb",
+        action="store_true",
+        default=False,
+        help="Save raw RGB frames (rgb/ directory).",
     )
     # vLLM sampling parameters - get defaults from VllmSamplingConfig
     sampling_defaults = _get_vllm_sampling_defaults()
