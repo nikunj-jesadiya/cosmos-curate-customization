@@ -30,6 +30,7 @@ def cli() -> None:
     dedup_module = importlib.import_module("cosmos_curate.pipelines.video.dedup_pipeline")
     shard_module = importlib.import_module("cosmos_curate.pipelines.video.sharding_pipeline")
     split_module = importlib.import_module("cosmos_curate.pipelines.video.splitting_pipeline")
+    track_module = importlib.import_module("cosmos_curate.pipelines.video.tracking_pipeline")
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -39,6 +40,7 @@ def cli() -> None:
     shard_module.add_shard_command(subparsers)
     split_module.add_split_command(subparsers)
     dedup_module.add_dedup_command(subparsers)
+    track_module.add_track_command(subparsers)
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
