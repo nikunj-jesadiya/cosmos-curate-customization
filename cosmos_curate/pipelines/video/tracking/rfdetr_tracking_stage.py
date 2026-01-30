@@ -22,6 +22,8 @@ pseudo-labels with instance and per-frame annotations.
 from __future__ import annotations
 
 import colorsys
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import cv2
@@ -53,13 +55,16 @@ if TYPE_CHECKING:
 
 TrackerType = Literal["deepocsort", "botsort", "bytetrack", "boosttrack", "hybridsort"]
 
+# Constants for track array indexing
+TRACK_CONFIDENCE_IDX = 5
+TRACK_CLASS_ID_IDX = 6
 
-def _generate_distinct_color(index: int, total: int = 100) -> list[int]:
+
+def _generate_distinct_color(index: int) -> list[int]:
     """Generate a distinct RGB color for a given index using golden ratio distribution.
 
     Args:
         index: Index of the color to generate.
-        total: Total number of colors to distribute across the hue spectrum.
 
     Returns:
         List of [R, G, B] values (0-255).
@@ -75,35 +80,31 @@ def _generate_distinct_color(index: int, total: int = 100) -> list[int]:
 def _draw_detections(
     image: np.ndarray,
     bboxes: np.ndarray,
-    confidences: np.ndarray,
     class_ids: np.ndarray,
     class_names: list[str],
-    line_thickness: int = 1,
-    font_scale: float = 0.4,
 ) -> np.ndarray:
     """Draw detection bounding boxes and labels on an image.
 
     Args:
         image: Input image (BGR format).
         bboxes: Bounding boxes array of shape (N, 4) in [x1, y1, x2, y2] format.
-        confidences: Confidence scores array of shape (N,).
         class_ids: Class ID array of shape (N,).
         class_names: List of class names.
-        line_thickness: Thickness of bounding box lines.
-        font_scale: Font scale for labels.
 
     Returns:
         Annotated image.
 
     """
     img = image.copy()
+    line_thickness = 1
+    font_scale = 0.4
 
-    for bbox, conf, cid in zip(bboxes, confidences, class_ids, strict=False):
+    for bbox, class_id_raw in zip(bboxes, class_ids, strict=False):
         x1, y1, x2, y2 = map(int, bbox)
-        cid = int(cid)
+        class_id = int(class_id_raw)
 
         # Generate color based on class_id
-        color = _generate_distinct_color(cid)
+        color = _generate_distinct_color(class_id)
         # Convert RGB to BGR for OpenCV
         color_bgr = (color[2], color[1], color[0])
 
@@ -111,7 +112,7 @@ def _draw_detections(
         cv2.rectangle(img, (x1, y1), (x2, y2), color_bgr, line_thickness)
 
         # Prepare label (class name only, no confidence)
-        class_name = class_names[cid] if cid < len(class_names) else f"class_{cid}"
+        class_name = class_names[class_id] if class_id < len(class_names) else f"class_{class_id}"
         label = class_name
 
         # Draw label text (white with black outline for visibility, no background box)
@@ -129,9 +130,6 @@ def _draw_tracks(
     image: np.ndarray,
     instances: list[dict[str, Any]],
     instances_info: dict[str, dict[str, Any]],
-    class_names: list[str],
-    line_thickness: int = 1,
-    font_scale: float = 0.4,
 ) -> np.ndarray:
     """Draw tracking bounding boxes and labels on an image.
 
@@ -139,20 +137,18 @@ def _draw_tracks(
         image: Input image (BGR format).
         instances: List of instance dicts with object_id, bounding_box_2d_tight, etc.
         instances_info: Dict mapping object_id to instance info (for color).
-        class_names: List of class names.
-        line_thickness: Thickness of bounding box lines.
-        font_scale: Font scale for labels.
 
     Returns:
         Annotated image.
 
     """
     img = image.copy()
+    line_thickness = 1
+    font_scale = 0.4
 
     for inst in instances:
         object_id = inst["object_id"]
         bbox = inst["bounding_box_2d_tight"]
-        confidence = inst.get("confidence", 1.0)
         class_id = inst.get("semantic_id", 0)
 
         x1, y1, x2, y2 = map(int, bbox)
@@ -197,8 +193,6 @@ def _encode_frames_to_video(
         MP4 video as bytes.
 
     """
-    import tempfile
-
     if not frames:
         return b""
 
@@ -206,44 +200,33 @@ def _encode_frames_to_video(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp_path = tmp.name
+        tmp_path = Path(tmp.name)
 
     try:
-        writer = cv2.VideoWriter(tmp_path, fourcc, fps, (width, height))
+        writer = cv2.VideoWriter(str(tmp_path), fourcc, fps, (width, height))
         for frame in frames:
             writer.write(frame)
         writer.release()
 
-        with open(tmp_path, "rb") as f:
-            video_bytes = f.read()
+        video_bytes = tmp_path.read_bytes()
     finally:
-        import os
-
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if tmp_path.exists():
+            tmp_path.unlink()
 
     return video_bytes
 
 
 def _get_tracker(
     tracker_name: TrackerType,
-    device: str = "0",
-    per_class: bool = False,
-    iou_threshold: float = 0.3,
-    det_thresh: float = 0.3,
-    max_age: int = 30,
-    min_hits: int = 3,
-) -> Any:
+    device: str,
+    config: TrackingConfig,
+) -> Any:  # noqa: ANN401
     """Create and return a BoxMOT tracker instance.
 
     Args:
         tracker_name: Name of the tracker to use.
         device: Device to run the tracker on.
-        per_class: Whether to track objects per class.
-        iou_threshold: IoU threshold for matching.
-        det_thresh: Detection confidence threshold.
-        max_age: Max frames to keep lost track.
-        min_hits: Min detections before confirming track.
+        config: Tracking configuration with per_class, thresholds, etc.
 
     Returns:
         Tracker instance.
@@ -254,7 +237,7 @@ def _get_tracker(
 
     """
     try:
-        from boxmot import BoostTrack, BotSort, ByteTrack, DeepOcSort, HybridSort
+        from boxmot import BoostTrack, BotSort, ByteTrack, DeepOcSort, HybridSort  # noqa: PLC0415
     except ImportError as e:
         msg = "Please install boxmot: pip install boxmot"
         raise ImportError(msg) from e
@@ -277,18 +260,18 @@ def _get_tracker(
     if tracker_name in reid_trackers:
         return trackers[tracker_name](
             device=device,
-            per_class=per_class,
-            iou_threshold=iou_threshold,
-            det_thresh=det_thresh,
-            max_age=max_age,
-            min_hits=min_hits,
+            per_class=config.per_class,
+            iou_threshold=config.iou_threshold,
+            det_thresh=config.detection_threshold,
+            max_age=config.max_age,
+            min_hits=config.min_hits,
         )
-    # ByteTrack (non-ReID)
+    # ByteTrack and other non-ReID trackers
     return trackers[tracker_name](
-        per_class=per_class,
-        iou_threshold=iou_threshold,
-        max_age=max_age,
-        min_hits=min_hits,
+        per_class=config.per_class,
+        iou_threshold=config.iou_threshold,
+        max_age=config.max_age,
+        min_hits=config.min_hits,
     )
 
 
@@ -307,6 +290,7 @@ class RFDETRTrackingStage(CuratorStage):
         self,
         tracking_config: TrackingConfig | None = None,
         num_gpus_per_worker: float = 1.0,
+        caption_source_video: Literal["raw", "detection", "tracking"] = "raw",
         *,
         verbose: bool = False,
         log_stats: bool = False,
@@ -316,6 +300,10 @@ class RFDETRTrackingStage(CuratorStage):
         Args:
             tracking_config: Configuration for tracking. If None, uses defaults.
             num_gpus_per_worker: Number of GPUs per worker.
+            caption_source_video: Which video to use for captioning:
+                - "raw": Use original raw video (default, no swap)
+                - "detection": Use detection visualization video
+                - "tracking": Use tracking visualization video
             verbose: Whether to print verbose logs.
             log_stats: Whether to log performance statistics.
 
@@ -323,24 +311,27 @@ class RFDETRTrackingStage(CuratorStage):
         self._timer = StageTimer(self)
         self._config = tracking_config or TrackingConfig()
         self._num_gpus_per_worker = num_gpus_per_worker
+        self._caption_source_video = caption_source_video
         self._verbose = verbose
         self._log_stats = log_stats
         self._model: Any = None
         self._process_count = 0
+        self._swap_count = 0
+        self._skip_count = 0
 
     def stage_setup(self) -> None:
         """Initialize stage resources and load RF-DETR model."""
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=True)
 
         try:
-            from rfdetr import RFDETRBase
-            from rfdetr.util.coco_classes import COCO_CLASSES
+            from rfdetr import RFDETRBase  # noqa: PLC0415
+            from rfdetr.util.coco_classes import COCO_CLASSES  # noqa: PLC0415
         except ImportError as e:
             msg = "Please install rfdetr: pip install rfdetr"
             raise ImportError(msg) from e
 
         # Store COCO_CLASSES for use in processing
-        self._coco_classes = COCO_CLASSES
+        self._coco_classes: list[str] = COCO_CLASSES
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._model = RFDETRBase(device=device)
@@ -348,17 +339,166 @@ class RFDETRTrackingStage(CuratorStage):
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
         logger.info(f"RF-DETR model loaded on {device}")
 
+        if self._caption_source_video != "raw":
+            logger.info(f"Captioning will use {self._caption_source_video} video instead of raw video")
+
     def destroy(self) -> None:
         """Clean up resources."""
         gpu_stage_cleanup(self.__class__.__name__)
         self._model = None
+
+        if self._caption_source_video != "raw":
+            logger.info(f"Video swap for captioning completed: {self._swap_count} swaps, {self._skip_count} skipped")
 
     @property
     def resources(self) -> CuratorStageResource:
         """Get the resource requirements for this stage."""
         return CuratorStageResource(gpus=self._num_gpus_per_worker)
 
-    def _process_clip(self, clip: Clip) -> None:
+    def _create_frame_instances(  # noqa: PLR0913
+        self,
+        tracks: np.ndarray,
+        result: TrackingResult,
+        frame_idx: int,
+        width: int,
+        height: int,
+        class_instance_counters: dict[int, int],
+    ) -> list[FrameInstance]:
+        """Create frame instances from tracking results.
+
+        Args:
+            tracks: Tracking results from BoxMOT.
+            result: Tracking result object to update.
+            frame_idx: Current frame index.
+            width: Frame width.
+            height: Frame height.
+            class_instance_counters: Counter dict for class instances.
+
+        Returns:
+            List of frame instances.
+
+        """
+        frame_instances: list[FrameInstance] = []
+
+        for track in tracks:
+            # track format: [x1, y1, x2, y2, track_id, confidence, class_id, ...]
+            track_id = int(track[4])
+            bbox_tight = BoundingBox2D(
+                xmin=float(track[0]),
+                ymin=float(track[1]),
+                xmax=float(track[2]),
+                ymax=float(track[3]),
+            )
+            confidence = float(track[TRACK_CONFIDENCE_IDX]) if len(track) > TRACK_CONFIDENCE_IDX else 1.0
+            class_id = int(track[TRACK_CLASS_ID_IDX]) if len(track) > TRACK_CLASS_ID_IDX else 0
+
+            # Filter by target classes if specified
+            class_name = self._coco_classes[class_id] if class_id < len(self._coco_classes) else "unknown"
+            if self._config.target_classes is not None and class_name not in self._config.target_classes:
+                continue
+
+            # Create unique object_id
+            object_id = f"{class_name}_{track_id}"
+
+            # Calculate loose bbox (expanded)
+            bbox_loose = bbox_tight.expand(
+                self._config.bbox_expansion_ratio,
+                width,
+                height,
+            )
+
+            # Add to instances if not exists
+            if object_id not in result.instances:
+                if class_id not in class_instance_counters:
+                    class_instance_counters[class_id] = 0
+                class_instance_counters[class_id] += 1
+                instance_id = class_instance_counters[class_id]
+
+                result.instances[object_id] = TrackedInstance(
+                    object_id=object_id,
+                    object_type=class_name,
+                    instance_id=instance_id,
+                    semantic_id=class_id,
+                    color=_generate_distinct_color(track_id),
+                    caption=f"{class_name} (track {track_id})",
+                    track_id=track_id,
+                    first_frame=frame_idx,
+                    last_frame=frame_idx,
+                    confidence_avg=confidence,
+                    frame_count=1,
+                )
+            else:
+                # Update existing instance
+                inst = result.instances[object_id]
+                inst.last_frame = frame_idx
+                inst.frame_count += 1
+                # Running average of confidence
+                n = inst.frame_count
+                inst.confidence_avg = inst.confidence_avg + (confidence - inst.confidence_avg) / n
+
+            # Add frame instance
+            frame_instances.append(
+                FrameInstance(
+                    object_id=object_id,
+                    instance_id=result.instances[object_id].instance_id,
+                    semantic_id=class_id,
+                    bounding_box_2d_tight=bbox_tight,
+                    bounding_box_2d_loose=bbox_loose,
+                    confidence=confidence,
+                )
+            )
+
+        return frame_instances
+
+    def _generate_visualizations(
+        self,
+        frame: np.ndarray,
+        detections: Any,  # noqa: ANN401
+        frame_instances: list[FrameInstance],
+        result: TrackingResult,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Generate detection and tracking visualization frames.
+
+        Args:
+            frame: Input frame (BGR).
+            detections: Detection results from RF-DETR.
+            frame_instances: Frame instances for this frame.
+            result: Tracking result with instance info.
+
+        Returns:
+            Tuple of (detection_vis, tracking_vis) frames.
+
+        """
+        # Convert instances to dict format for draw_tracks
+        instances_dict = [
+            {
+                "object_id": inst.object_id,
+                "bounding_box_2d_tight": inst.bounding_box_2d_tight.to_list(),
+                "confidence": inst.confidence,
+                "semantic_id": inst.semantic_id,
+            }
+            for inst in frame_instances
+        ]
+        instances_info = {obj_id: {"color": inst.color} for obj_id, inst in result.instances.items()}
+
+        # Draw detection visualization
+        det_img = _draw_detections(
+            image=frame,
+            bboxes=detections.xyxy if len(detections.xyxy) > 0 else np.empty((0, 4)),
+            class_ids=detections.class_id if len(detections.xyxy) > 0 else np.empty((0,)),
+            class_names=self._coco_classes,
+        )
+
+        # Draw tracking visualization
+        track_img = _draw_tracks(
+            image=frame,
+            instances=instances_dict,
+            instances_info=instances_info,
+        )
+
+        return det_img, track_img
+
+    def _process_clip(self, clip: Clip) -> None:  # noqa: C901, PLR0912, PLR0915
         """Process a single clip with detection and tracking.
 
         Args:
@@ -384,18 +524,14 @@ class RFDETRTrackingStage(CuratorStage):
             metadata = clip.extract_metadata()
             if metadata and metadata.get("framerate"):
                 clip_fps = float(metadata["framerate"])
-        except Exception:
-            pass  # Use default FPS if metadata extraction fails
+        except (KeyError, ValueError, TypeError) as e:
+            logger.debug(f"Could not extract FPS from clip {clip.uuid}, using default {clip_fps}: {e}")
 
         # Create tracker for this clip
         tracker = _get_tracker(
             tracker_name=self._config.tracker_name,  # type: ignore[arg-type]
             device=device,
-            per_class=self._config.per_class,
-            iou_threshold=self._config.iou_threshold,
-            det_thresh=self._config.detection_threshold,
-            max_age=self._config.max_age,
-            min_hits=self._config.min_hits,
+            config=self._config,
         )
 
         # Initialize tracking result
@@ -442,76 +578,14 @@ class RFDETRTrackingStage(CuratorStage):
 
             # Build frame annotation
             frame_key = f"clip_{clip.uuid}_frame_{frame_idx:06d}"
-            frame_instances: list[FrameInstance] = []
-
-            for track in tracks:
-                # track format: [x1, y1, x2, y2, track_id, confidence, class_id, ...]
-                track_id = int(track[4])
-                bbox_tight = BoundingBox2D(
-                    xmin=float(track[0]),
-                    ymin=float(track[1]),
-                    xmax=float(track[2]),
-                    ymax=float(track[3]),
-                )
-                confidence = float(track[5]) if len(track) > 5 else 1.0
-                class_id = int(track[6]) if len(track) > 6 else 0
-
-                # Filter by target classes if specified
-                class_name = self._coco_classes[class_id] if class_id < len(self._coco_classes) else "unknown"
-                if self._config.target_classes is not None:
-                    if class_name not in self._config.target_classes:
-                        continue
-
-                # Create unique object_id
-                object_id = f"{class_name}_{track_id}"
-
-                # Calculate loose bbox (expanded)
-                bbox_loose = bbox_tight.expand(
-                    self._config.bbox_expansion_ratio,
-                    width,
-                    height,
-                )
-
-                # Add to instances if not exists
-                if object_id not in result.instances:
-                    if class_id not in class_instance_counters:
-                        class_instance_counters[class_id] = 0
-                    class_instance_counters[class_id] += 1
-                    instance_id = class_instance_counters[class_id]
-
-                    result.instances[object_id] = TrackedInstance(
-                        object_id=object_id,
-                        object_type=class_name,
-                        instance_id=instance_id,
-                        semantic_id=class_id,
-                        color=_generate_distinct_color(track_id),
-                        caption=f"{class_name} (track {track_id})",
-                        track_id=track_id,
-                        first_frame=frame_idx,
-                        last_frame=frame_idx,
-                        confidence_avg=confidence,
-                        frame_count=1,
-                    )
-                else:
-                    # Update existing instance
-                    inst = result.instances[object_id]
-                    inst.last_frame = frame_idx
-                    inst.frame_count += 1
-                    # Running average of confidence
-                    n = inst.frame_count
-                    inst.confidence_avg = inst.confidence_avg + (confidence - inst.confidence_avg) / n
-
-                # Add frame instance
-                frame_instances.append(
-                    FrameInstance(
-                        object_id=object_id,
-                        instance_id=result.instances[object_id].instance_id,
-                        semantic_id=class_id,
-                        bounding_box_2d_tight=bbox_tight,
-                        bounding_box_2d_loose=bbox_loose,
-                        confidence=confidence,
-                    )
-                )
+            frame_instances = self._create_frame_instances(
+                tracks=tracks,
+                result=result,
+                frame_idx=frame_idx,
+                width=width,
+                height=height,
+                class_instance_counters=class_instance_counters,
+            )
 
             # Store frame annotation
             result.frames[frame_key] = FrameAnnotation(
@@ -529,33 +603,11 @@ class RFDETRTrackingStage(CuratorStage):
 
             # Generate visualization frames/video if configured
             if self._config.save_vis_frames or self._config.save_video:
-                # Convert instances to dict format for draw_tracks
-                instances_dict = [
-                    {
-                        "object_id": inst.object_id,
-                        "bounding_box_2d_tight": inst.bounding_box_2d_tight.to_list(),
-                        "confidence": inst.confidence,
-                        "semantic_id": inst.semantic_id,
-                    }
-                    for inst in frame_instances
-                ]
-                instances_info = {obj_id: {"color": inst.color} for obj_id, inst in result.instances.items()}
-
-                # Draw detection visualization
-                det_img = _draw_detections(
-                    image=frame,
-                    bboxes=detections.xyxy if len(detections.xyxy) > 0 else np.empty((0, 4)),
-                    confidences=detections.confidence if len(detections.xyxy) > 0 else np.empty((0,)),
-                    class_ids=detections.class_id if len(detections.xyxy) > 0 else np.empty((0,)),
-                    class_names=self._coco_classes,
-                )
-
-                # Draw tracking visualization
-                track_img = _draw_tracks(
-                    image=frame,
-                    instances=instances_dict,
-                    instances_info=instances_info,
-                    class_names=self._coco_classes,
+                det_img, track_img = self._generate_visualizations(
+                    frame=frame,
+                    detections=detections,
+                    frame_instances=frame_instances,
+                    result=result,
                 )
 
                 # Encode as JPEG and store (only if save_vis_frames is enabled)
@@ -623,8 +675,6 @@ class RFDETRTrackingStage(CuratorStage):
             List of frames as numpy arrays (BGR format), or None if decoding fails.
 
         """
-        import tempfile
-
         frames: list[npt.NDArray[np.uint8]] = []
 
         # Write to temp file for OpenCV
@@ -646,8 +696,54 @@ class RFDETRTrackingStage(CuratorStage):
 
         return frames if frames else None
 
+    def _swap_video_for_captioning(self, clip: Clip, video_type: str) -> bool:
+        """Swap clip's encoded_data with annotated video for captioning.
+
+        Args:
+            clip: Clip to process.
+            video_type: Type of video to use ("detection" or "tracking").
+
+        Returns:
+            True if swap was successful, False otherwise.
+
+        """
+        # Skip if no tracking result
+        if clip.tracking_result is None:
+            logger.warning(
+                f"Clip {clip.uuid}: No tracking result available, cannot use {video_type} video for captioning"
+            )
+            return False
+
+        # Get the appropriate video bytes based on source type
+        if video_type == "detection":
+            video_bytes = clip.tracking_result.detection_video_bytes
+        elif video_type == "tracking":
+            video_bytes = clip.tracking_result.tracking_video_bytes
+        else:
+            return False
+
+        # Check if the video is available
+        if video_bytes is None or len(video_bytes) == 0:
+            logger.warning(
+                f"Clip {clip.uuid}: {video_type} video not available, using original raw video for captioning"
+            )
+            return False
+
+        # Swap the encoded_data with the annotated video
+        original_size = len(clip.encoded_data) if clip.encoded_data else 0
+        clip.encoded_data = video_bytes
+        new_size = len(clip.encoded_data)
+
+        # Always log video swap for visibility
+        logger.info(
+            f"Clip {clip.uuid}: Swapped to {video_type} video for captioning "
+            f"(original: {original_size / 1024:.1f} KB, new: {new_size / 1024:.1f} KB)"
+        )
+
+        return True
+
     @nvtx.annotate("RFDETRTrackingStage")  # type: ignore[misc]
-    def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask] | None:
+    def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask] | None:  # noqa: C901
         """Process video clips with detection and tracking.
 
         Args:
@@ -667,13 +763,24 @@ class RFDETRTrackingStage(CuratorStage):
                         continue
                     try:
                         self._process_clip(clip)
-                    except Exception as e:
-                        logger.exception(f"Error tracking clip {clip.uuid}: {e}")
-                        clip.errors["tracking"] = str(e)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(f"Error tracking clip {clip.uuid}")
+                        clip.errors["tracking"] = "tracking_failed"
 
             if self._log_stats:
                 stage_name, stage_perf_stats = self._timer.log_stats()
                 task.stage_perf[stage_name] = stage_perf_stats
+
+        # Swap video source for captioning if configured
+        if self._caption_source_video != "raw":
+            for task in tasks:
+                video = task.video
+                for clip in video.clips:
+                    success = self._swap_video_for_captioning(clip, self._caption_source_video)
+                    if success:
+                        self._swap_count += 1
+                    else:
+                        self._skip_count += 1
 
         # Free memory periodically
         self._process_count += 1

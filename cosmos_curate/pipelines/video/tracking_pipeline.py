@@ -465,6 +465,51 @@ def split(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
         embedding_model_version = get_all_models_by_id().get(embedding_model_id, {}).get("version", "unspecified")  # type: ignore[assignment]
         logger.debug(f"Embedding model id={embedding_model_id} version={embedding_model_version}")
 
+    # ==========================================================================
+    # Object Tracking / Pseudo-Labeling Stage (moved before captioning)
+    # ==========================================================================
+    if args.generate_tracking:
+        # Parse target classes if provided
+        target_classes = None
+        if args.tracking_target_classes:
+            target_classes = [c.strip() for c in args.tracking_target_classes.split(",")]
+
+        tracking_config = TrackingConfig(
+            tracker_name=args.tracking_algorithm,
+            detection_threshold=args.tracking_detection_threshold,
+            iou_threshold=args.tracking_iou_threshold,
+            per_class=args.tracking_per_class,
+            min_track_frames=args.tracking_min_track_frames,
+            max_age=args.tracking_max_age,
+            min_hits=args.tracking_min_hits,
+            target_classes=target_classes,
+            save_vis_frames=args.tracking_save_vis or args.tracking_save_video,
+            save_video=args.tracking_save_video or (args.caption_source_video in ["detection", "tracking"]),
+            save_rgb_frames=args.tracking_save_rgb,
+        )
+
+        stages += [
+            CuratorStageSpec(
+                RFDETRTrackingStage(
+                    tracking_config=tracking_config,
+                    num_gpus_per_worker=args.tracking_gpus_per_worker,
+                    caption_source_video=args.caption_source_video,  # type: ignore[arg-type]
+                    verbose=args.verbose,
+                    log_stats=args.perf_profile,
+                ),
+            ),
+        ]
+        logger.info(
+            f"Object tracking enabled: algorithm={args.tracking_algorithm}, "
+            f"threshold={args.tracking_detection_threshold}"
+        )
+    elif args.caption_source_video != "raw":
+        # Warn if user wants to use detection/tracking video but tracking is not enabled
+        logger.warning(
+            f"--caption-source-video={args.caption_source_video} specified but "
+            f"--generate-tracking is not enabled. Captioning will use raw video."
+        )
+
     caption_algo = args.captioning_algorithm.lower()
     keep_mp4 = args.generate_previews or (args.generate_cosmos_predict_dataset != "disable") or caption_algo == "gemini"
 
@@ -663,44 +708,6 @@ def split(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
                 ),
             ),
         ]
-
-    # ==========================================================================
-    # Object Tracking / Pseudo-Labeling Stage
-    # ==========================================================================
-    if args.generate_tracking:
-        # Parse target classes if provided
-        target_classes = None
-        if args.tracking_target_classes:
-            target_classes = [c.strip() for c in args.tracking_target_classes.split(",")]
-
-        tracking_config = TrackingConfig(
-            tracker_name=args.tracking_algorithm,
-            detection_threshold=args.tracking_detection_threshold,
-            iou_threshold=args.tracking_iou_threshold,
-            per_class=args.tracking_per_class,
-            min_track_frames=args.tracking_min_track_frames,
-            max_age=args.tracking_max_age,
-            min_hits=args.tracking_min_hits,
-            target_classes=target_classes,
-            save_vis_frames=args.tracking_save_vis or args.tracking_save_video,
-            save_video=args.tracking_save_video,
-            save_rgb_frames=args.tracking_save_rgb,
-        )
-
-        stages += [
-            CuratorStageSpec(
-                RFDETRTrackingStage(
-                    tracking_config=tracking_config,
-                    num_gpus_per_worker=args.tracking_gpus_per_worker,
-                    verbose=args.verbose,
-                    log_stats=args.perf_profile,
-                ),
-            ),
-        ]
-        logger.info(
-            f"Object tracking enabled: algorithm={args.tracking_algorithm}, "
-            f"threshold={args.tracking_detection_threshold}"
-        )
 
     stages.append(
         CuratorStageSpec(
@@ -1520,7 +1527,10 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         "--tracking-target-classes",
         type=str,
         default=None,
-        help="Comma-separated list of COCO class names to track (e.g., 'car,truck,person'). If not provided, tracks all classes.",
+        help=(
+            "Comma-separated list of COCO class names to track (e.g., 'car,truck,person'). "
+            "If not provided, tracks all classes."
+        ),
     )
     parser.add_argument(
         "--tracking-save-vis",
@@ -1542,6 +1552,18 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         action="store_true",
         default=False,
         help="Save raw RGB frames (rgb/ directory).",
+    )
+    parser.add_argument(
+        "--caption-source-video",
+        type=str,
+        default="raw",
+        choices=["raw", "detection", "tracking"],
+        help=(
+            "Select which video to use for captioning:\n"
+            "  - raw: Use original raw video (default, backward compatible)\n"
+            "  - detection: Use detection visualization video with bounding boxes and class labels\n"
+            "  - tracking: Use tracking visualization video with track IDs and bounding boxes"
+        ),
     )
     # vLLM sampling parameters - get defaults from VllmSamplingConfig
     sampling_defaults = _get_vllm_sampling_defaults()
